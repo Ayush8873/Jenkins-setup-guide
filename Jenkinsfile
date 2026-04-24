@@ -2,13 +2,14 @@ pipeline {
     agent any
 
     environment {
-        IMAGE_NAME = "jenkins-test-app"
+        DOCKERHUB_REPO = "ayush2027/jenkins-test-app"
+        IMAGE_TAG      = "${BUILD_NUMBER}"
 
         PROD_CONTAINER = "jenkins-test-container"
         TEMP_CONTAINER = "jenkins-test-new"
 
-        PROD_PORT = "80"
-        TEMP_PORT = "8081"
+        PROD_PORT      = "80"
+        TEMP_PORT      = "8081"
     }
 
     stages {
@@ -22,23 +23,76 @@ pipeline {
         stage('Build Docker Image') {
             steps {
                 sh '''
-                echo "🔨 Building Docker image..."
-                docker build -t $IMAGE_NAME:latest .
+                    echo "🔨 Building Docker image..."
+                    docker build -t $DOCKERHUB_REPO:$IMAGE_TAG .
                 '''
             }
         }
 
-        stage('Deploy New Version (Temp)') {
+        /* =========================
+           🛡️ TRIVY SCAN ADDED HERE
+        ========================== */
+        stage('Trivy Scan (Non-blocking)') {
             steps {
                 sh '''
-                echo "🚀 Starting new version on temp port..."
+                    echo "🛡️ Running Trivy security scan..."
 
-                docker rm -f $TEMP_CONTAINER || true
+                    docker run --rm \
+                        -v /var/run/docker.sock:/var/run/docker.sock \
+                        -v $WORKSPACE:/workspace \
+                        aquasec/trivy image \
+                        --severity CRITICAL,HIGH \
+                        --exit-code 0 \
+                        --format json \
+                        --output /workspace/trivy-report.json \
+                        $DOCKERHUB_REPO:$IMAGE_TAG
+                '''
+            }
+        }
 
-                docker run -d \
-                  --name $TEMP_CONTAINER \
-                  -p $TEMP_PORT:80 \
-                  $IMAGE_NAME:latest
+        stage('Login to DockerHub') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-creds',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh '''
+                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                    '''
+                }
+            }
+        }
+
+        stage('Push Image to DockerHub') {
+            steps {
+                sh '''
+                    echo "📤 Pushing image to DockerHub..."
+                    docker push $DOCKERHUB_REPO:$IMAGE_TAG
+                '''
+            }
+        }
+
+        stage('Pull Image') {
+            steps {
+                sh '''
+                    echo "📥 Pulling image: $IMAGE_TAG"
+                    docker pull $DOCKERHUB_REPO:$IMAGE_TAG
+                '''
+            }
+        }
+
+        stage('Deploy Temp Container') {
+            steps {
+                sh '''
+                    echo "🚀 Starting temp container..."
+
+                    docker rm -f $TEMP_CONTAINER || true
+
+                    docker run -d \
+                        --name $TEMP_CONTAINER \
+                        -p $TEMP_PORT:80 \
+                        $DOCKERHUB_REPO:$IMAGE_TAG
                 '''
             }
         }
@@ -46,73 +100,56 @@ pipeline {
         stage('Health Check') {
             steps {
                 sh '''
-                echo "🩺 Running health check..."
+                    echo "🩺 Running health check..."
+                    sleep 10
 
-                sleep 10
+                    for i in $(seq 1 5); do
+                        if docker exec $TEMP_CONTAINER curl -f http://localhost; then
+                            echo "✅ Health check passed"
+                            exit 0
+                        fi
+                        echo "⏳ Retry $i..."
+                        sleep 5
+                    done
 
-                for i in {1..5}; do
-                  if docker exec $TEMP_CONTAINER curl -f http://localhost; then
-                    echo "✅ Health check passed"
-                    exit 0
-                  fi
-                  echo "⏳ Retry $i..."
-                  sleep 5
-                done
-
-                echo "❌ Health check failed"
-                docker logs $TEMP_CONTAINER
-                docker rm -f $TEMP_CONTAINER
-                exit 1
+                    echo "❌ Health check failed"
+                    docker logs $TEMP_CONTAINER
+                    docker rm -f $TEMP_CONTAINER
+                    exit 1
                 '''
             }
         }
 
-        stage('Switch Traffic to New Version') {
+        stage('Switch to Production') {
             steps {
                 sh '''
-                echo "🔄 Switching traffic to new version..."
+                    echo "🔄 Switching traffic to new version..."
 
-                # STEP 1: Stop anything currently using port 80
-                OLD_CONTAINER=$(docker ps --filter "publish=80" -q)
+                    docker rm -f $PROD_CONTAINER || true
 
-                if [ ! -z "$OLD_CONTAINER" ]; then
-                    echo "Stopping old container using port 80: $OLD_CONTAINER"
-                    docker stop $OLD_CONTAINER
-                    docker rm $OLD_CONTAINER
-                fi
+                    docker run -d \
+                        --name $PROD_CONTAINER \
+                        --restart unless-stopped \
+                        -p $PROD_PORT:80 \
+                        $DOCKERHUB_REPO:$IMAGE_TAG
 
-                # STEP 2: Ensure old named container is removed
-                docker rm -f $PROD_CONTAINER || true
+                    docker rm -f $TEMP_CONTAINER || true
 
-                # STEP 3: Start NEW container on port 80
-                docker run -d \
-                  --name $PROD_CONTAINER \
-                  --restart unless-stopped \
-                  -p $PROD_PORT:80 \
-                  $IMAGE_NAME:latest
-
-                # STEP 4: Remove temp container
-                docker rm -f $TEMP_CONTAINER || true
-
-                echo "🎉 Successfully switched to new version on port 80"
+                    echo "🎉 Deployment successful: version $IMAGE_TAG"
                 '''
             }
         }
     }
 
     post {
-
         success {
-            echo "✅ Deployment SUCCESS: New version live on port 80"
+            echo "✅ SUCCESS: Version ${IMAGE_TAG} deployed successfully"
+            archiveArtifacts artifacts: 'trivy-report.json', allowEmptyArchive: true
         }
 
         failure {
-            echo "❌ Deployment FAILED: Rolling back..."
-
-            sh '''
-            docker rm -f $TEMP_CONTAINER || true
-            echo "Rollback complete - old version still running (if not replaced)."
-            '''
+            echo "❌ FAILED: Cleaning up temp container"
+            sh 'docker rm -f jenkins-test-new || true'
         }
     }
 }
