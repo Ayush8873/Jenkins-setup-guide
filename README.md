@@ -161,7 +161,7 @@ pipeline {
     agent any
 
     environment {
-        DOCKERHUB_REPO = "your-dockerhub-username/jenkins-test-app"
+        DOCKERHUB_REPO = "ayush2027/jenkins-test-app"
         IMAGE_TAG      = "${BUILD_NUMBER}"
 
         PROD_CONTAINER = "jenkins-test-container"
@@ -173,45 +173,85 @@ pipeline {
 
     stages {
 
-        stage('Checkout') {
-            steps { checkout scm }
-        }
-
-        stage('Build Image') {
+        stage('Checkout Code') {
             steps {
-                sh 'docker build -t $DOCKERHUB_REPO:$IMAGE_TAG .'
+                checkout scm
             }
         }
 
-        stage('Docker Login') {
+        stage('Build Docker Image') {
+            steps {
+                sh '''
+                    echo "🔨 Building Docker image..."
+                    docker build -t $DOCKERHUB_REPO:$IMAGE_TAG .
+                '''
+            }
+        }
+
+        /* =========================
+           🛡️ TRIVY SCAN ADDED HERE
+        ========================== */
+        stage('Trivy Scan (Non-blocking)') {
+            steps {
+                sh '''
+                    echo "🛡️ Running Trivy security scan..."
+
+                    docker run --rm \
+                        -v /var/run/docker.sock:/var/run/docker.sock \
+                        -v $WORKSPACE:/workspace \
+                        aquasec/trivy image \
+                        --severity CRITICAL,HIGH \
+                        --exit-code 0 \
+                        --format json \
+                        --output /workspace/trivy-report.json \
+                        $DOCKERHUB_REPO:$IMAGE_TAG
+                '''
+            }
+        }
+
+        stage('Login to DockerHub') {
             steps {
                 withCredentials([usernamePassword(
                     credentialsId: 'dockerhub-creds',
-                    usernameVariable: 'USER',
-                    passwordVariable: 'PASS'
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
                 )]) {
-                    sh 'echo "$PASS" | docker login -u "$USER" --password-stdin'
+                    sh '''
+                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                    '''
                 }
             }
         }
 
-        stage('Push Image') {
+        stage('Push Image to DockerHub') {
             steps {
-                sh 'docker push $DOCKERHUB_REPO:$IMAGE_TAG'
+                sh '''
+                    echo "📤 Pushing image to DockerHub..."
+                    docker push $DOCKERHUB_REPO:$IMAGE_TAG
+                '''
             }
         }
 
         stage('Pull Image') {
             steps {
-                sh 'docker pull $DOCKERHUB_REPO:$IMAGE_TAG'
+                sh '''
+                    echo "📥 Pulling image: $IMAGE_TAG"
+                    docker pull $DOCKERHUB_REPO:$IMAGE_TAG
+                '''
             }
         }
 
         stage('Deploy Temp Container') {
             steps {
                 sh '''
-                docker rm -f $TEMP_CONTAINER || true
-                docker run -d --name $TEMP_CONTAINER -p $TEMP_PORT:80 $DOCKERHUB_REPO:$IMAGE_TAG
+                    echo "🚀 Starting temp container..."
+
+                    docker rm -f $TEMP_CONTAINER || true
+
+                    docker run -d \
+                        --name $TEMP_CONTAINER \
+                        -p $TEMP_PORT:80 \
+                        $DOCKERHUB_REPO:$IMAGE_TAG
                 '''
             }
         }
@@ -219,20 +259,22 @@ pipeline {
         stage('Health Check') {
             steps {
                 sh '''
-                sleep 10
-                for i in {1..5}; do
-                    if docker exec $TEMP_CONTAINER curl -f http://localhost; then
-                        echo "Health Check Passed"
-                        exit 0
-                    fi
-                    echo "Retry $i..."
-                    sleep 5
-                done
+                    echo "🩺 Running health check..."
+                    sleep 10
 
-                echo "Health Check Failed"
-                docker logs $TEMP_CONTAINER
-                docker rm -f $TEMP_CONTAINER
-                exit 1
+                    for i in $(seq 1 5); do
+                        if docker exec $TEMP_CONTAINER curl -f http://localhost; then
+                            echo "✅ Health check passed"
+                            exit 0
+                        fi
+                        echo "⏳ Retry $i..."
+                        sleep 5
+                    done
+
+                    echo "❌ Health check failed"
+                    docker logs $TEMP_CONTAINER
+                    docker rm -f $TEMP_CONTAINER
+                    exit 1
                 '''
             }
         }
@@ -240,15 +282,19 @@ pipeline {
         stage('Switch to Production') {
             steps {
                 sh '''
-                docker rm -f $PROD_CONTAINER || true
+                    echo "🔄 Switching traffic to new version..."
 
-                docker run -d \
-                    --name $PROD_CONTAINER \
-                    --restart unless-stopped \
-                    -p $PROD_PORT:80 \
-                    $DOCKERHUB_REPO:$IMAGE_TAG
+                    docker rm -f $PROD_CONTAINER || true
 
-                docker rm -f $TEMP_CONTAINER || true
+                    docker run -d \
+                        --name $PROD_CONTAINER \
+                        --restart unless-stopped \
+                        -p $PROD_PORT:80 \
+                        $DOCKERHUB_REPO:$IMAGE_TAG
+
+                    docker rm -f $TEMP_CONTAINER || true
+
+                    echo "🎉 Deployment successful: version $IMAGE_TAG"
                 '''
             }
         }
@@ -256,10 +302,12 @@ pipeline {
 
     post {
         success {
-            echo "✅ Deployment Successful: Version ${IMAGE_TAG}"
+            echo "✅ SUCCESS: Version ${IMAGE_TAG} deployed successfully"
+            archiveArtifacts artifacts: 'trivy-report.json', allowEmptyArchive: true
         }
+
         failure {
-            echo "❌ Deployment Failed"
+            echo "❌ FAILED: Cleaning up temp container"
             sh 'docker rm -f jenkins-test-new || true'
         }
     }
