@@ -1,7 +1,3 @@
-Here’s your content converted back into a **clean, well-structured README.md (proper Markdown format):**
-
----
-
 # 📘 Jenkins + Docker Blue-Green CI/CD Pipeline (EC2 Setup)
 
 ![Jenkins](https://img.shields.io/badge/jenkins-%23D24939.svg?style=for-the-badge\&logo=jenkins\&logoColor=white)
